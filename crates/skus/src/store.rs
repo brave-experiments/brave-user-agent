@@ -77,6 +77,11 @@ pub struct Credential {
     pub valid_to: String,
     /// Whether this one has already been presented.
     pub spent: bool,
+    /// Which key derivation this token was blinded with.
+    ///
+    /// Stored per credential because the two derivations yield different verification keys, and
+    /// picking the wrong one produces a signature the server rejects with nothing to explain it.
+    pub rfc: bool,
 }
 
 impl StoredCredentials {
@@ -111,6 +116,7 @@ impl From<Registration> for StoredCredentials {
                     valid_from: c.valid_from,
                     valid_to: c.valid_to,
                     spent: false,
+                    rfc: c.rfc,
                 })
                 .collect(),
         }
@@ -150,6 +156,112 @@ pub fn load(channel: crate::Channel) -> Result<StoredCredentials, StoreError> {
     decode(&raw)
 }
 
+/// A batch held open for a session, spending from memory.
+///
+/// # Why this is not read per request
+///
+/// Reading the keychain prompts the user on macOS, and a credential is spent on *every* model
+/// request, so touching the keychain per spend asks for a password several times per task. That is
+/// worse than it sounds: prompts that often train a person to approve them without reading, which
+/// costs more security than the per-use check was buying.
+///
+/// So the batch is read once, spent from memory, and the spent markers are written back when the
+/// session ends or when [`Wallet::flush`] is called. The exposure is unchanged: a decrypted
+/// credential was already in this process's memory the moment it was read.
+///
+/// The failure mode is losing spend markers if the process dies, which means a credential that was
+/// presented is still recorded as unspent. That is deliberately the direction to fail in: a batch
+/// is hundreds of credentials valid for days, so wasting a few is free, and the alternative
+/// (recording a spend that never happened) is what runs the batch down for no benefit.
+pub struct Wallet {
+    batch: StoredCredentials,
+    /// Where a flush writes to, or `None` for a detached batch that must never be written.
+    ///
+    /// Holding the destination rather than deciding at flush time is what makes a detached wallet
+    /// safe: there is no channel to write to, so no code path, including [`Drop`], can reach the
+    /// keychain. A boolean would leave a real destination sitting there for a later edit to use.
+    destination: Option<crate::Channel>,
+    /// Whether anything has been spent since the last write.
+    dirty: bool,
+}
+
+impl Wallet {
+    /// Read a channel's batch, prompting at most once.
+    pub fn open(channel: crate::Channel) -> Result<Self, StoreError> {
+        Ok(Self {
+            batch: load(channel)?,
+            destination: Some(channel),
+            dirty: false,
+        })
+    }
+
+    /// Hold a batch that is already in hand, with no keychain behind it.
+    ///
+    /// For tests, including those in crates above this one, which is why it is public. A test must
+    /// never touch the real keychain: it would prompt whoever ran it, and in CI there is nobody to
+    /// answer, so the run would fail on a machine difference rather than on the code.
+    ///
+    /// The result is detached, so spending and flushing behave normally but nothing is ever
+    /// written, not even by [`Drop`].
+    pub fn detached(batch: StoredCredentials) -> Self {
+        Self {
+            batch,
+            destination: None,
+            dirty: false,
+        }
+    }
+
+    /// Take the next credential usable at `now`, marking it spent in memory.
+    pub fn spend(&mut self, now: &str) -> Result<Spent, StoreError> {
+        let index = self.batch.next_usable(now).ok_or(StoreError::Exhausted)?;
+        self.batch.credentials[index].spent = true;
+        self.dirty = true;
+
+        Ok(Spent {
+            credential: self.batch.credentials[index].clone(),
+            issuer: self.batch.issuer.clone(),
+            remaining: self.batch.remaining(),
+        })
+    }
+
+    /// Write the spent markers back, if any.
+    ///
+    /// A no-op when nothing was spent, so an idle session never touches the keychain and never
+    /// prompts, and a no-op for a detached batch, which has nowhere to write.
+    pub fn flush(&mut self) -> Result<(), StoreError> {
+        let Some(channel) = self.destination.filter(|_| self.dirty) else {
+            return Ok(());
+        };
+        save(channel, &self.batch)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.batch.remaining()
+    }
+}
+
+/// Writes the spent markers back, so a session that ends normally does not replay credentials.
+///
+/// Errors are dropped: this runs during teardown where there is nothing useful to do with one, and
+/// the consequence is only that some spent credentials look unspent next time.
+impl Drop for Wallet {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+/// A credential taken out of the store, already recorded as used.
+#[derive(Debug, Clone)]
+pub struct Spent {
+    pub credential: Credential,
+    /// The issuer string this credential's presentation signs over.
+    pub issuer: String,
+    /// How many are left, so a caller can warn before the batch runs out.
+    pub remaining: usize,
+}
+
 /// Forget a channel's batch.
 pub fn clear(channel: crate::Channel) -> Result<(), StoreError> {
     match entry(channel)?.delete_credential() {
@@ -174,6 +286,7 @@ fn encode(credentials: &StoredCredentials) -> String {
                 "valid_from": c.valid_from,
                 "valid_to": c.valid_to,
                 "spent": c.spent,
+                "rfc": c.rfc,
             }))
             .collect::<Vec<_>>(),
     })
@@ -218,6 +331,12 @@ fn decode(raw: &str) -> Result<StoredCredentials, StoreError> {
                     .get("spent")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                // Every batch this writes is blinded with the rfc derivation, so that is the
+                // reading for an entry that predates the field being recorded.
+                rfc: c
+                    .get("rfc")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
             }
         })
         .collect::<Vec<_>>();
@@ -251,15 +370,91 @@ mod tests {
                     valid_from: "2026-08-22T00:00:00".to_string(),
                     valid_to: "2026-08-23T00:00:00".to_string(),
                     spent: false,
+                    rfc: true,
                 },
                 Credential {
                     unblinded: "token-two".to_string(),
                     valid_from: "2026-08-23T00:00:00".to_string(),
                     valid_to: "2026-08-24T00:00:00".to_string(),
                     spent: false,
+                    rfc: true,
                 },
             ],
         }
+    }
+
+    /// The reason Wallet exists: spending must not touch the keychain, because a credential is
+    /// spent per model request and prompting that often is what drove the design.
+    ///
+    /// Asserted through the dirty flag, which is what decides whether a write happens at all.
+    #[test]
+    fn spending_does_not_write_until_asked_to() {
+        let mut wallet = Wallet::detached(batch());
+        assert!(!wallet.dirty, "a freshly opened batch has nothing to write");
+
+        wallet
+            .spend("2026-08-22T12:00:00")
+            .expect("a usable credential");
+        assert!(wallet.dirty, "a spend must be recorded for the next flush");
+        assert_eq!(wallet.remaining(), 1);
+    }
+
+    /// A session that spends nothing must never write, so opening the agent and not using premium
+    /// does not prompt for the keychain at all.
+    #[test]
+    fn a_session_that_spends_nothing_never_writes() {
+        let mut wallet = Wallet::detached(batch());
+        wallet.flush().expect("flushing nothing is a no-op");
+        assert!(!wallet.dirty);
+    }
+
+    /// A detached batch must have no keychain destination at all, which is what lets these tests
+    /// run in CI: there is nobody to answer a password prompt there, so a test that could reach the
+    /// real keychain would hang or fail on a machine difference rather than on the code.
+    #[test]
+    fn a_detached_batch_has_nowhere_to_write() {
+        let mut wallet = Wallet::detached(batch());
+        assert!(wallet.destination.is_none());
+
+        wallet
+            .spend("2026-08-22T12:00:00")
+            .expect("a usable credential");
+        assert!(wallet.dirty, "the spend is recorded in memory");
+
+        // Flushing a dirty detached batch is still a no-op, so neither this nor Drop can write.
+        wallet.flush().expect("a detached flush cannot fail");
+        assert!(wallet.dirty, "and it stays unwritten");
+    }
+
+    /// Two spends in one session must hand out different credentials: the whole batch is held in
+    /// memory, so an index that did not advance would replay the same one every request.
+    #[test]
+    fn consecutive_spends_hand_out_different_credentials() {
+        let mut batch = batch();
+        // Both windows cover the same moment, so the only thing separating them is the spent mark.
+        batch.credentials[1].valid_from = batch.credentials[0].valid_from.clone();
+        batch.credentials[1].valid_to = batch.credentials[0].valid_to.clone();
+
+        let mut wallet = Wallet::detached(batch);
+        let first = wallet.spend("2026-08-22T12:00:00").expect("first");
+        let second = wallet.spend("2026-08-22T12:00:00").expect("second");
+
+        assert_ne!(first.credential.unblinded, second.credential.unblinded);
+        assert_eq!(second.remaining, 0);
+    }
+
+    /// Once every credential in the window is spent, further requests must be refused rather than
+    /// replaying one the server has already seen.
+    #[test]
+    fn spending_past_the_end_of_the_batch_is_refused() {
+        let mut wallet = Wallet::detached(batch());
+        wallet
+            .spend("2026-08-22T12:00:00")
+            .expect("the one usable credential");
+        assert!(matches!(
+            wallet.spend("2026-08-22T12:00:00"),
+            Err(StoreError::Exhausted)
+        ));
     }
 
     #[test]

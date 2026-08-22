@@ -24,6 +24,9 @@ hmac = "0.12"
 keyring = "4"
 landlock = "0.4"
 libc = "0.2"
+# Pinned to the major version challenge-bypass-ristretto takes its RNG traits from, so
+# OsRng is the same type both crates expect.
+rand = "0.8"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 ratatui = { version = "0.30", features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }

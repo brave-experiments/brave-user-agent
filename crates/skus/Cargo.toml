@@ -8,5 +8,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+challenge-bypass-ristretto = { workspace = true }
+hmac = { workspace = true }
 keyring = { workspace = true }
+rand = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+ureq = { workspace = true }
