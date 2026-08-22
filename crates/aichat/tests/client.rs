@@ -532,12 +532,12 @@ struct StubSubscription {
 }
 
 impl bua_aichat::Subscription for StubSubscription {
-    fn next_credential(&mut self) -> Option<bua_aichat::SubscriptionCredential> {
+    fn next_credential(&mut self) -> Result<bua_aichat::SubscriptionCredential, String> {
         if self.remaining == 0 {
-            return None;
+            return Err("the imported credentials are used up".to_string());
         }
         self.remaining -= 1;
-        Some(bua_aichat::SubscriptionCredential {
+        Ok(bua_aichat::SubscriptionCredential {
             cookie_name: "__Secure-sku#brave-leo-premium".to_string(),
             cookie_value: "presented-credential".to_string(),
         })
@@ -587,13 +587,14 @@ fn a_subscribed_request_goes_to_the_premium_host_with_the_credential() {
     );
 }
 
-/// Once the batch is spent the request must fall back to the free host, and must not carry a
-/// cookie: sending a subscription credential to the free endpoint would leak it to a host it does
-/// not belong to.
+/// Once the batch is spent the request must fail rather than quietly going out on the free tier.
+/// A downgrade nobody was told about is indistinguishable from the service getting worse, and it
+/// would also spend a premium-tier allowance the user thought they had paid past.
 #[test]
-fn an_exhausted_subscription_falls_back_to_the_free_host_without_a_credential() {
-    let (free_endpoint, received) = serve(REPLY);
-    let config = premium_config(&free_endpoint, "http://127.0.0.1:1");
+fn an_exhausted_subscription_fails_rather_than_downgrading() {
+    // Both hosts point at a listener, so a fallback would succeed and this would pass wrongly.
+    let (free_endpoint, _received) = serve(REPLY);
+    let config = premium_config(&free_endpoint, &free_endpoint);
     let egress = Egress::new();
     let mut sink = RecordingSink::new();
     let mut policy = Policy::begin(
@@ -607,12 +608,16 @@ fn an_exhausted_subscription_falls_back_to_the_free_host_without_a_credential() 
     let mut subscription = StubSubscription { remaining: 0 };
     let mut client = AichatClient::new(&config, &egress).with_subscription(&mut subscription);
     let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
-    client
-        .complete(&mut policy, &request)
-        .expect("completion succeeds");
 
-    let captured = received.recv().expect("request captured");
-    assert_eq!(captured.header("cookie"), None);
+    let err = client
+        .complete(&mut policy, &request)
+        .expect_err("an unusable subscription must fail the request");
+    let shown = err.to_string();
+    assert!(shown.contains("subscription"), "unclear error: {shown}");
+    assert!(
+        shown.contains("import-leo-creds"),
+        "no remedy offered: {shown}"
+    );
 }
 
 /// A build with no premium host must stay on the free tier even when credentials exist, rather

@@ -536,8 +536,8 @@ fn parse_batches(body: &str) -> Result<Vec<SignedBatch>, DeviceError> {
             signed,
             proof,
             public_key,
-            valid_from: text("validFrom", "valid_from"),
-            valid_to: text("validTo", "valid_to"),
+            valid_from: naive_timestamp(&text("validFrom", "valid_from")),
+            valid_to: naive_timestamp(&text("validTo", "valid_to")),
         });
     }
 
@@ -548,6 +548,18 @@ fn parse_batches(body: &str) -> Result<Vec<SignedBatch>, DeviceError> {
     }
 
     Ok(batches)
+}
+
+/// Drop the zone marker the credential service puts on a validity timestamp.
+///
+/// The service sends `...Z`, but a presentation must not carry it: brave-core parses these into a
+/// zone-less local type and re-serialises them without one, and the presented document has to match
+/// what the verifying end expects. Passing the string through verbatim looks harmless and produces a
+/// document that differs from every other client's by one character.
+///
+/// Only the marker goes. These are already UTC, so nothing is being converted.
+fn naive_timestamp(value: &str) -> String {
+    value.trim_end_matches('Z').to_string()
 }
 
 fn batch_url(base_url: &str, order_id: &str, item_id: &str, request_id: &str) -> String {
@@ -760,7 +772,8 @@ mod tests {
         let batches = parse_batches(&batch_body(&blinded, &signed, &proof, &public_key)).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].signed.len(), 4);
-        assert_eq!(batches[0].valid_to, "2026-08-23T00:00:00Z");
+        // Stored without the zone marker, which is the form a presentation must carry.
+        assert_eq!(batches[0].valid_to, "2026-08-23T00:00:00");
     }
 
     /// The proof is the whole point of the exchange: a batch signed by some other key must be
@@ -844,6 +857,41 @@ mod tests {
     }
 
     /// The request path is built from the order and item ids, so it must be the documented shape.
+    /// The service sends `...Z` but a presentation must not carry it, because brave-core round-trips
+    /// these through a zone-less type and the verifying end expects that form. One stray character
+    /// is the difference between a valid presentation and a rejected one.
+    #[test]
+    fn the_zone_marker_is_dropped_from_validity_timestamps() {
+        assert_eq!(
+            naive_timestamp("2026-08-22T20:18:06Z"),
+            "2026-08-22T20:18:06"
+        );
+        // Already zone-less, so unchanged rather than truncated.
+        assert_eq!(
+            naive_timestamp("2026-08-22T20:18:06"),
+            "2026-08-22T20:18:06"
+        );
+        assert_eq!(naive_timestamp(""), "");
+    }
+
+    /// The decoded batch must already hold the presentable form, so nothing downstream has to
+    /// remember to strip it.
+    #[test]
+    fn a_decoded_batch_holds_presentable_timestamps() {
+        let tokens: Vec<Token> = (0..2)
+            .map(|_| Token::random::<Sha512, _>(&mut OsRng))
+            .collect();
+        let blinded: Vec<BlindedToken> = tokens
+            .iter()
+            .map(|t| t.blind_rfc::<Sha512>().unwrap())
+            .collect();
+        let (signed, proof, public_key) = sign_batch(&blinded);
+
+        let batches = parse_batches(&batch_body(&blinded, &signed, &proof, &public_key)).unwrap();
+        assert_eq!(batches[0].valid_to, "2026-08-23T00:00:00");
+        assert!(!batches[0].valid_from.ends_with('Z'));
+    }
+
     #[test]
     fn the_batch_url_addresses_the_orders_item() {
         assert_eq!(

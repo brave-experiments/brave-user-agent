@@ -143,6 +143,11 @@ pub fn save(channel: crate::Channel, credentials: &StoredCredentials) -> Result<
 }
 
 /// Read a channel's batch.
+///
+/// Blocks for as long as the keychain takes, including while a password dialog waits to be
+/// answered. There is no timeout: the answer to "may this read the credential" is the user's to
+/// give, and abandoning the question would only turn it into a failure that looks like something
+/// else. If this appears to hang, a dialog is waiting, possibly behind another window.
 pub fn load(channel: crate::Channel) -> Result<StoredCredentials, StoreError> {
     let raw = match entry(channel)?.get_password() {
         Ok(raw) => raw,
@@ -294,6 +299,12 @@ fn encode(credentials: &StoredCredentials) -> String {
 }
 
 fn decode(raw: &str) -> Result<StoredCredentials, StoreError> {
+    // An entry can exist holding nothing, if a write was interrupted partway. Reported as absent
+    // rather than malformed, because the fix is the same as never having imported: run the import.
+    if raw.trim().is_empty() {
+        return Err(StoreError::NotFound);
+    }
+
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| StoreError::Malformed {
             detail: format!("not valid JSON: {e}"),
@@ -500,6 +511,15 @@ mod tests {
     fn a_window_does_not_include_its_own_end() {
         let batch = batch();
         assert_eq!(batch.next_usable("2026-08-23T00:00:00"), Some(1));
+    }
+
+    /// An interrupted write can leave the entry present but empty. Reported as absent, since the
+    /// remedy is the same as never having imported, and a JSON parse error here would send someone
+    /// looking for corruption instead.
+    #[test]
+    fn an_empty_entry_is_reported_as_absent_rather_than_malformed() {
+        assert!(matches!(decode("").unwrap_err(), StoreError::NotFound));
+        assert!(matches!(decode("   ").unwrap_err(), StoreError::NotFound));
     }
 
     #[test]

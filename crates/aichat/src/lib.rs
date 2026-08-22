@@ -30,6 +30,10 @@ pub enum ChatError {
     Egress(EgressError),
     /// A well-formed response carrying no usable content.
     NoContent,
+    /// A subscription is configured but no credential could be presented.
+    ///
+    /// Fails the request rather than falling back: see [`AichatClient::route`].
+    Subscription(String),
 }
 
 impl fmt::Display for ChatError {
@@ -39,6 +43,11 @@ impl fmt::Display for ChatError {
             Self::Decode { detail } => write!(f, "unexpected response: {detail}"),
             Self::Egress(e) => write!(f, "{e}"),
             Self::NoContent => f.write_str("the response contained no message content"),
+            Self::Subscription(detail) => write!(
+                f,
+                "the Leo subscription could not be used: {detail}. Run `bua import-leo-creds` to \
+                 refresh it, or unset the premium endpoint to use the free tier"
+            ),
         }
     }
 }
@@ -76,12 +85,12 @@ pub struct Completion {
 /// spends it, so a request has to ask for its own rather than reuse a cached value. It is also
 /// what keeps this crate independent of where credentials come from.
 pub trait Subscription {
-    /// The cookie value presenting the next credential, or `None` to send this request on the
-    /// free tier.
+    /// The cookie value presenting the next credential.
     ///
-    /// Returning `None` rather than failing is deliberate: an exhausted or expired batch should
-    /// degrade to the free tier, not break the session.
-    fn next_credential(&mut self) -> Option<SubscriptionCredential>;
+    /// An error here fails the request. It deliberately does not fall back to the free tier: a
+    /// configured subscription that silently stops being used looks like the model got worse for
+    /// no reason, and the one thing worse than an error is an unexplained downgrade.
+    fn next_credential(&mut self) -> Result<SubscriptionCredential, String>;
 }
 
 /// A credential ready to be attached to one request.
@@ -90,6 +99,14 @@ pub struct SubscriptionCredential {
     pub cookie_name: String,
     /// The presented credential.
     pub cookie_value: String,
+}
+
+/// Redacting rather than derived: the value is a bearer credential, and the obvious debugging
+/// reflex of printing a request would otherwise put a live one in a log.
+impl fmt::Debug for SubscriptionCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SubscriptionCredential({}=<redacted>)", self.cookie_name)
+    }
 }
 
 pub struct AichatClient<'a> {
@@ -118,20 +135,25 @@ impl<'a> AichatClient<'a> {
     /// The premium host and the credential travel together: a credential belongs to the premium
     /// deployment, so a build with no premium host stays on the free tier rather than sending the
     /// credential somewhere it does not belong.
-    fn route(&mut self) -> (String, Option<SubscriptionCredential>) {
+    ///
+    /// With both a premium host and a subscription, this is premium or nothing. A credential that
+    /// cannot be produced fails the request rather than quietly reverting to the free tier, because
+    /// a downgrade nobody was told about is indistinguishable from the service getting worse.
+    fn route(&mut self) -> Result<(String, Option<SubscriptionCredential>), ChatError> {
         let free = self.config.chat_completions_url();
 
         let Some(premium_url) = self.config.premium_chat_completions_url() else {
-            return (free, None);
+            return Ok((free, None));
         };
 
-        match self
-            .subscription
-            .as_mut()
-            .and_then(|source| source.next_credential())
-        {
-            Some(credential) => (premium_url, Some(credential)),
-            None => (free, None),
+        match self.subscription.as_mut() {
+            Some(source) => match source.next_credential() {
+                Ok(credential) => Ok((premium_url, Some(credential))),
+                Err(detail) => Err(ChatError::Subscription(detail)),
+            },
+            // Premium is configured but nothing has been imported, which is not an error: the free
+            // tier is what an unsubscribed caller gets.
+            None => Ok((free, None)),
         }
     }
 
@@ -149,7 +171,7 @@ impl<'a> AichatClient<'a> {
         let headers =
             bua_signing::sign(self.config.signing_key.expose(), &self.config.key_id, &body);
 
-        let (url, credential) = self.route();
+        let (url, credential) = self.route()?;
 
         let mut http = Request::post(url, body)
             .header("content-type", "application/json")
@@ -214,7 +236,7 @@ impl<'a> AichatClient<'a> {
         let headers =
             bua_signing::sign(self.config.signing_key.expose(), &self.config.key_id, &body);
 
-        let (url, credential) = self.route();
+        let (url, credential) = self.route()?;
 
         let mut http = Request::post(url, body)
             .header("content-type", "application/json")

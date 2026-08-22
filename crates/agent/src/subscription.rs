@@ -4,9 +4,9 @@
 //! because a credential is single-use: the client has to ask for one per request, and the store
 //! has to record each as spent, so something has to sit between them and hold the channel.
 //!
-//! A failure never breaks the turn. An exhausted batch, an expired one, or a locked keychain all
-//! resolve to `None`, which sends the request on the free tier. Losing premium quality is a far
-//! better outcome than refusing to answer.
+//! A failure here fails the turn rather than reverting to the free tier. That is deliberate: a
+//! subscription that silently stops being used looks like the model got worse for no reason, and
+//! the error names the fix (re-import, or unset the premium endpoint).
 
 use bua_aichat::{Subscription, SubscriptionCredential};
 use bua_skus::Channel;
@@ -19,9 +19,6 @@ pub struct ImportedSubscription {
     wallet: bua_skus::store::Wallet,
     /// The clock, as an injectable function so a test need not wait for a real date.
     now: fn() -> String,
-    /// Set once the batch is known to be unusable, so a turn does not retry on every round of a
-    /// long tool loop.
-    exhausted: bool,
     /// How many credentials were left after the last spend, for a caller that wants to warn.
     remaining: Option<usize>,
 }
@@ -32,7 +29,6 @@ impl ImportedSubscription {
         Some(Self {
             wallet: bua_skus::store::Wallet::open(channel).ok()?,
             now: current_timestamp,
-            exhausted: false,
             remaining: None,
         })
     }
@@ -47,7 +43,6 @@ impl ImportedSubscription {
         Self {
             wallet: bua_skus::store::Wallet::detached(batch),
             now: current_timestamp,
-            exhausted: false,
             remaining: None,
         }
     }
@@ -70,31 +65,18 @@ impl ImportedSubscription {
 }
 
 impl Subscription for ImportedSubscription {
-    fn next_credential(&mut self) -> Option<SubscriptionCredential> {
-        if self.exhausted {
-            return None;
-        }
+    fn next_credential(&mut self) -> Result<SubscriptionCredential, String> {
+        let spent = self
+            .wallet
+            .spend(&(self.now)())
+            .map_err(|e| e.to_string())?;
 
-        let spent = match self.wallet.spend(&(self.now)()) {
-            Ok(spent) => spent,
-            Err(_) => {
-                // Whatever went wrong, it will go wrong again this turn.
-                self.exhausted = true;
-                return None;
-            }
-        };
-
-        let value = match bua_skus::device::present(&spent.credential, &spent.issuer) {
-            Ok(value) => value,
-            Err(_) => {
-                self.exhausted = true;
-                return None;
-            }
-        };
+        let value = bua_skus::device::present(&spent.credential, &spent.issuer)
+            .map_err(|e| e.to_string())?;
 
         self.remaining = Some(spent.remaining);
 
-        Some(SubscriptionCredential {
+        Ok(SubscriptionCredential {
             cookie_name: bua_skus::CREDENTIAL_COOKIE_NAME.to_string(),
             cookie_value: value,
         })
@@ -185,8 +167,8 @@ mod tests {
             item_id: "item".to_string(),
             issuer: "brave.com?sku=brave-leo-premium".to_string(),
             credentials: vec![bua_skus::store::Credential {
-                // Not a real token, so presenting it fails. That is what this exercises: a
-                // credential that cannot be presented must degrade to the free tier.
+                // Not a real token, so presenting it fails. That is what the error paths below
+                // exercise, without needing a signed batch from the service.
                 unblinded: "not-a-token".to_string(),
                 valid_from: "2026-08-22T00:00:00".to_string(),
                 valid_to: "2026-08-23T00:00:00".to_string(),
@@ -196,33 +178,36 @@ mod tests {
         }
     }
 
-    /// Once the batch cannot be used, nothing further is attempted for the rest of the turn.
+    /// An empty batch must report an error, not hand back nothing and let the request quietly go
+    /// out on the free tier.
     #[test]
-    fn an_exhausted_subscription_stops_asking() {
-        let mut subscription = ImportedSubscription::detached(batch());
-        subscription.exhausted = true;
-        assert!(subscription.next_credential().is_none());
-    }
-
-    /// An empty batch must send the request on the free tier rather than failing the turn: losing
-    /// premium quality is a much better outcome than refusing to answer.
-    #[test]
-    fn a_batch_with_nothing_usable_falls_back_rather_than_failing() {
+    fn a_batch_with_nothing_usable_is_an_error() {
         let mut empty = batch();
         empty.credentials.clear();
         let mut subscription = ImportedSubscription::detached(empty);
 
-        assert!(subscription.next_credential().is_none());
-        // And it stops trying, so a long tool loop does not retry every round.
-        assert!(subscription.exhausted);
+        let err = subscription
+            .next_credential()
+            .expect_err("an empty batch cannot be spent");
+        assert!(err.contains("used up"), "unhelpful message: {err}");
     }
 
-    /// A credential that cannot be turned into a presentation must also degrade rather than
-    /// propagate, since there is nothing the user could do about it mid-turn.
+    /// A credential that cannot be turned into a presentation is also an error, since the request
+    /// would otherwise be downgraded with nothing said about it.
     #[test]
-    fn a_credential_that_cannot_be_presented_falls_back() {
+    fn a_credential_that_cannot_be_presented_is_an_error() {
         let mut subscription = ImportedSubscription::detached(batch());
-        assert!(subscription.next_credential().is_none());
-        assert!(subscription.exhausted);
+        assert!(subscription.next_credential().is_err());
+    }
+
+    /// The error has to name what to do about it: a bare failure mid-task leaves nothing to act on.
+    #[test]
+    fn the_exhausted_error_says_how_to_fix_it() {
+        let mut empty = batch();
+        empty.credentials.clear();
+        let mut subscription = ImportedSubscription::detached(empty);
+
+        let err = subscription.next_credential().unwrap_err();
+        assert!(err.contains("import-leo-creds"), "no remedy offered: {err}");
     }
 }
