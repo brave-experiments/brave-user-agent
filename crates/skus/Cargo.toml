@@ -1,0 +1,12 @@
+[package]
+name = "bua-skus"
+description = "Imports a Leo Premium subscription from a local Brave install by registering as a new device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+keyring = { workspace = true }
+serde_json = { workspace = true }
