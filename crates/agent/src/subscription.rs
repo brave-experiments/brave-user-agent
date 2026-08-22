@@ -9,7 +9,10 @@
 //! the error names the fix (re-import, or unset the premium endpoint).
 
 use bua_aichat::{Subscription, SubscriptionCredential};
-use bua_skus::Channel;
+use bua_skus::{Channel, DeviceError, Registration, StoreError};
+
+/// How a new batch is obtained, as a function so a test can supply one without a network.
+type Register = fn(&str, &str) -> Result<Registration, DeviceError>;
 
 /// Spends credentials from the keychain, one per request.
 ///
@@ -21,6 +24,12 @@ pub struct ImportedSubscription {
     now: fn() -> String,
     /// How many credentials were left after the last spend, for a caller that wants to warn.
     remaining: Option<usize>,
+    /// How a replacement batch is obtained when the current one runs out.
+    register: Register,
+    /// Supplies the request id a refill registers under.
+    new_request_id: fn() -> String,
+    /// Whether a refill has already been attempted this session.
+    refilled: bool,
 }
 
 impl ImportedSubscription {
@@ -30,6 +39,9 @@ impl ImportedSubscription {
             wallet: bua_skus::store::Wallet::open(channel).ok()?,
             now: current_timestamp,
             remaining: None,
+            register: default_register,
+            new_request_id: bua_skus::new_request_id,
+            refilled: false,
         })
     }
 
@@ -44,6 +56,15 @@ impl ImportedSubscription {
             wallet: bua_skus::store::Wallet::detached(batch),
             now: current_timestamp,
             remaining: None,
+            // Refusing rather than reaching the network, so a test that unexpectedly triggers a
+            // refill fails loudly instead of making a live request.
+            register: |_, _| {
+                Err(DeviceError::Transport {
+                    detail: "no network in tests".to_string(),
+                })
+            },
+            new_request_id: || "test-request-id".to_string(),
+            refilled: false,
         }
     }
 
@@ -53,9 +74,7 @@ impl ImportedSubscription {
     /// Opening is the same read that checks for one, so this prompts at most once rather than
     /// probing every channel first.
     pub fn discover() -> Option<Self> {
-        [Channel::Stable, Channel::Beta, Channel::Nightly]
-            .into_iter()
-            .find_map(Self::new)
+        Channel::ALL.into_iter().find_map(Self::new)
     }
 
     /// How many credentials remained after the last one was spent.
@@ -66,10 +85,20 @@ impl ImportedSubscription {
 
 impl Subscription for ImportedSubscription {
     fn next_credential(&mut self) -> Result<SubscriptionCredential, String> {
-        let spent = self
-            .wallet
-            .spend(&(self.now)())
-            .map_err(|e| e.to_string())?;
+        let now = (self.now)();
+
+        let spent = match self.wallet.spend(&now) {
+            Ok(spent) => spent,
+            // A batch covers a few daily windows and then stops working, usually with most of it
+            // unspent, so running out is the expected end of its life rather than a fault. The
+            // subscription is still paid for and everything needed to mint more is already here, so
+            // refill instead of making the user re-run the import.
+            Err(StoreError::Exhausted | StoreError::Expired { .. }) => {
+                self.refill()?;
+                self.wallet.spend(&now).map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(e.to_string()),
+        };
 
         let value = bua_skus::device::present(&spent.credential, &spent.issuer)
             .map_err(|e| e.to_string())?;
@@ -81,6 +110,37 @@ impl Subscription for ImportedSubscription {
             cookie_value: value,
         })
     }
+}
+
+impl ImportedSubscription {
+    /// Mint a new batch for the same order and put it in the wallet.
+    ///
+    /// Registers again under a **fresh** request id. Reusing the stored one would claim the existing
+    /// batch rather than ask for a new one, which is the case the service answers with a conflict.
+    fn refill(&mut self) -> Result<(), String> {
+        // Attempted once per session. A second failure in the same run would not be a different
+        // answer, and retrying inside a tool loop would mint batches in a circle.
+        if self.refilled {
+            return Err("the subscription credentials could not be renewed".to_string());
+        }
+        self.refilled = true;
+
+        let order_id = self.wallet.order_id().to_string();
+        let registration =
+            (self.register)(&order_id, &(self.new_request_id)()).map_err(|e| e.to_string())?;
+
+        self.wallet.refill(registration.into());
+
+        // Written now rather than at session end: a batch that cost a round trip to obtain should
+        // survive the process not exiting cleanly.
+        self.wallet.flush().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Register against the real service.
+fn default_register(order_id: &str, request_id: &str) -> Result<Registration, DeviceError> {
+    bua_skus::device::register(bua_skus::PAYMENT_BASE_URL, order_id, request_id)
 }
 
 /// The current time, in the fixed-width UTC form the stored windows use.
@@ -178,18 +238,125 @@ mod tests {
         }
     }
 
-    /// An empty batch must report an error, not hand back nothing and let the request quietly go
-    /// out on the free tier.
+    /// A batch that stops working must be replaced automatically. The subscription is still paid
+    /// for and everything needed to mint more is already stored, so making the user re-run the
+    /// import by hand would be a gap rather than a safeguard.
     #[test]
-    fn a_batch_with_nothing_usable_is_an_error() {
+    fn an_expired_batch_is_refilled_rather_than_failing() {
+        let mut expired = batch();
+        expired.credentials[0].valid_from = "2020-01-01T00:00:00".to_string();
+        expired.credentials[0].valid_to = "2020-01-02T00:00:00".to_string();
+
+        let mut subscription = ImportedSubscription::detached(expired);
+        subscription.register = |_, _| Ok(fresh_registration());
+
+        let credential = subscription
+            .next_credential()
+            .expect("an expired batch is replaced");
+        assert_eq!(credential.cookie_name, bua_skus::CREDENTIAL_COOKIE_NAME);
+        assert!(subscription.refilled);
+    }
+
+    /// Same for a batch whose credentials are all spent rather than expired.
+    #[test]
+    fn a_spent_batch_is_refilled() {
+        let mut spent = batch();
+        spent.credentials[0].spent = true;
+
+        let mut subscription = ImportedSubscription::detached(spent);
+        subscription.register = |_, _| Ok(fresh_registration());
+
+        assert!(subscription.next_credential().is_ok());
+    }
+
+    /// A refill registers against the order already stored, so nothing has to be re-read from the
+    /// browser profile, which may not even be installed any more.
+    #[test]
+    fn a_refill_uses_the_stored_order() {
+        let mut expired = batch();
+        expired.credentials.clear();
+
+        let mut subscription = ImportedSubscription::detached(expired);
+        subscription.register = |order_id, request_id| {
+            assert_eq!(order_id, "order", "refilled against the wrong order");
+            assert!(!request_id.is_empty(), "a refill needs a request id");
+            Ok(fresh_registration())
+        };
+
+        assert!(subscription.next_credential().is_ok());
+    }
+
+    /// One attempt per session. Retrying inside a tool loop would mint batches in a circle, each
+    /// costing a round trip, and the second answer would not differ from the first.
+    #[test]
+    fn a_failing_refill_is_attempted_only_once() {
+        let mut empty = batch();
+        empty.credentials.clear();
+
+        let mut subscription = ImportedSubscription::detached(empty);
+        subscription.register = |_, _| {
+            Err(DeviceError::Transport {
+                detail: "the service is unreachable".to_string(),
+            })
+        };
+
+        assert!(subscription.next_credential().is_err());
+        assert!(subscription.refilled);
+        // The second call must not try again, so it reports the refusal rather than the transport
+        // error a fresh attempt would produce.
+        let second = subscription.next_credential().unwrap_err();
+        assert!(second.contains("could not be renewed"), "retried: {second}");
+    }
+
+    /// A batch obtained at the cost of a round trip is written immediately rather than at session
+    /// end, so an unclean exit does not throw it away.
+    #[test]
+    fn a_refill_is_flushed_immediately() {
+        let mut empty = batch();
+        empty.credentials.clear();
+
+        let mut subscription = ImportedSubscription::detached(empty);
+        subscription.register = |_, _| Ok(fresh_registration());
+        subscription.next_credential().expect("refilled");
+
+        // Detached, so the flush cannot have written to a keychain; what matters is that the new
+        // batch is in hand and spendable.
+        assert!(subscription.remaining().is_some());
+    }
+
+    /// A registration with one usable credential, as the service would return.
+    fn fresh_registration() -> bua_skus::Registration {
+        bua_skus::Registration {
+            order_id: "order".to_string(),
+            item_id: "item".to_string(),
+            issuer: "brave.com?sku=brave-leo-premium".to_string(),
+            credentials: vec![bua_skus::device::SignedCredential {
+                unblinded: bua_skus::device::test_credential(),
+                // Open-ended, so the credential is valid whenever the test happens to run.
+                valid_from: "2000-01-01T00:00:00".to_string(),
+                valid_to: "2999-01-01T00:00:00".to_string(),
+                rfc: true,
+            }],
+        }
+    }
+
+    /// When the batch is unusable *and* it cannot be replaced, the request fails and says so. This
+    /// is the fallback behind the automatic refill, not the first response to running out.
+    #[test]
+    fn an_unusable_batch_that_cannot_be_refilled_is_an_error() {
         let mut empty = batch();
         empty.credentials.clear();
         let mut subscription = ImportedSubscription::detached(empty);
+        subscription.register = |_, _| {
+            Err(DeviceError::Transport {
+                detail: "the service is unreachable".to_string(),
+            })
+        };
 
         let err = subscription
             .next_credential()
-            .expect_err("an empty batch cannot be spent");
-        assert!(err.contains("used up"), "unhelpful message: {err}");
+            .expect_err("an empty batch that cannot be refilled cannot be spent");
+        assert!(err.contains("subscription service"), "unclear error: {err}");
     }
 
     /// A credential that cannot be turned into a presentation is also an error, since the request
@@ -198,16 +365,5 @@ mod tests {
     fn a_credential_that_cannot_be_presented_is_an_error() {
         let mut subscription = ImportedSubscription::detached(batch());
         assert!(subscription.next_credential().is_err());
-    }
-
-    /// The error has to name what to do about it: a bare failure mid-task leaves nothing to act on.
-    #[test]
-    fn the_exhausted_error_says_how_to_fix_it() {
-        let mut empty = batch();
-        empty.credentials.clear();
-        let mut subscription = ImportedSubscription::detached(empty);
-
-        let err = subscription.next_credential().unwrap_err();
-        assert!(err.contains("import-leo-creds"), "no remedy offered: {err}");
     }
 }

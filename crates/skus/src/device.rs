@@ -304,6 +304,38 @@ pub fn present(credential: &crate::store::Credential, issuer: &str) -> Result<St
     Ok(base64_encode(request.to_string().as_bytes()))
 }
 
+/// Mint one credential without a service, for tests in crates above this one.
+///
+/// Signed by a throwaway key and verified through the same batch proof a real one goes through, so
+/// what comes out is a genuinely presentable credential rather than a stub. Not `#[cfg(test)]`
+/// because a unit-test-only item is invisible to other crates.
+#[doc(hidden)]
+pub fn test_credential() -> String {
+    use challenge_bypass_ristretto::voprf::SigningKey;
+
+    let token = Token::random::<Sha512, _>(&mut OsRng);
+    let blinded = [token.blind_rfc::<Sha512>().expect("blinding a fresh token")];
+
+    let key = SigningKey::random(&mut OsRng);
+    let signed: Vec<SignedToken> = blinded
+        .iter()
+        .map(|b| key.sign(b).expect("signing a blinded token"))
+        .collect();
+    let proof = BatchDLEQProof::new::<Sha512, _>(&mut OsRng, &blinded, &signed, &key)
+        .expect("proving a batch");
+
+    proof
+        .verify_and_unblind::<Sha512, _>(
+            std::iter::once(&token),
+            &blinded,
+            &signed,
+            &key.public_key,
+        )
+        .expect("a batch this signed must verify")
+        .remove(0)
+        .encode_base64()
+}
+
 /// Read the order, and with it what credentials may be issued.
 fn fetch_order(
     agent: &ureq::Agent,

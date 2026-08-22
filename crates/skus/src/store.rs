@@ -27,8 +27,13 @@ pub enum StoreError {
     Unavailable { detail: String },
     /// The entry exists but is not what this version writes.
     Malformed { detail: String },
-    /// Every credential in the batch has been spent or has expired.
+    /// Every credential valid now has been spent.
     Exhausted,
+    /// The batch's last validity window has closed.
+    ///
+    /// Separate from [`StoreError::Exhausted`] because it is the usual way a batch stops working,
+    /// and it typically happens with most of the batch never used.
+    Expired { until: String, unspent: usize },
 }
 
 impl std::fmt::Display for StoreError {
@@ -42,7 +47,12 @@ impl std::fmt::Display for StoreError {
                 write!(f, "the stored credentials are unusable: {detail}")
             }
             Self::Exhausted => f.write_str(
-                "the imported credentials are used up; run `bua import-leo-creds` again",
+                "every credential valid today has been spent; run `bua import-leo-creds` again",
+            ),
+            Self::Expired { until, unspent } => write!(
+                f,
+                "the imported credentials expired at {until} with {unspent} never used; \
+                 run `bua import-leo-creds` again"
             ),
         }
     }
@@ -99,6 +109,20 @@ impl StoredCredentials {
         self.credentials
             .iter()
             .position(|c| !c.spent && c.valid_from.as_str() <= now && now < c.valid_to.as_str())
+    }
+
+    /// Whether every credential's window has closed by `now`.
+    ///
+    /// Distinct from being spent, and the distinction matters because it is the common case: a
+    /// batch covers a few daily windows, so it usually stops working with most of it never used.
+    /// Reporting that as "used up" would send someone looking for heavy usage that did not happen.
+    pub fn expired(&self, now: &str) -> bool {
+        !self.credentials.is_empty() && self.credentials.iter().all(|c| c.valid_to.as_str() <= now)
+    }
+
+    /// The end of the last window, which is when this batch stops being usable.
+    pub fn usable_until(&self) -> Option<&str> {
+        self.credentials.iter().map(|c| c.valid_to.as_str()).max()
     }
 }
 
@@ -218,7 +242,20 @@ impl Wallet {
 
     /// Take the next credential usable at `now`, marking it spent in memory.
     pub fn spend(&mut self, now: &str) -> Result<Spent, StoreError> {
-        let index = self.batch.next_usable(now).ok_or(StoreError::Exhausted)?;
+        let index = match self.batch.next_usable(now) {
+            Some(index) => index,
+            // Nothing usable is normal rather than exceptional: a batch covers a few daily windows
+            // and stops working when the last one closes, usually with most of it unspent. So the
+            // two cases are reported apart, and the caller refills rather than giving up.
+            None if self.batch.expired(now) => {
+                return Err(StoreError::Expired {
+                    until: self.batch.usable_until().unwrap_or("unknown").to_string(),
+                    unspent: self.batch.remaining(),
+                });
+            }
+            None => return Err(StoreError::Exhausted),
+        };
+
         self.batch.credentials[index].spent = true;
         self.dirty = true;
 
@@ -227,6 +264,20 @@ impl Wallet {
             issuer: self.batch.issuer.clone(),
             remaining: self.batch.remaining(),
         })
+    }
+
+    /// The order this batch belongs to, so a refill knows what to register against.
+    pub fn order_id(&self) -> &str {
+        &self.batch.order_id
+    }
+
+    /// Replace the batch with a freshly issued one, keeping the same destination.
+    ///
+    /// Marked dirty so the new batch is written even though nothing has been spent from it yet:
+    /// losing it would mean minting another on the next run for no reason.
+    pub fn refill(&mut self, batch: StoredCredentials) {
+        self.batch = batch;
+        self.dirty = true;
     }
 
     /// Write the spent markers back, if any.
