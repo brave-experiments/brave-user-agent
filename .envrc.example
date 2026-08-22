@@ -42,8 +42,18 @@ export BRAVE_AI_CHAT_ENDPOINT="https://ai-chat.bsg.brave.software"
 #
 # Optional. Without it premium is unavailable and every request goes to the endpoint
 # above; a subscription credential is never sent to the free host, since it does not
-# belong there. It has to match the environment the subscription was bought in, so a
-# real subscription needs the production host.
+# belong there.
+#
+# This must match the environment the subscription was created in, because a credential
+# only verifies against its own environment's issuer. So pick the pair together:
+#
+#   dev/staging key  ->  ai-chat-premium.bsg.brave.software
+#                        bua import-leo-creds development
+#   production key   ->  ai-chat-premium.bsg.brave.com
+#                        bua import-leo-creds stable
+#
+# Mismatching them returns 401: error 40101 for a key from the wrong environment, and
+# 40104 for a credential from one.
 export BRAVE_AI_CHAT_PREMIUM_ENDPOINT="https://ai-chat-premium.bsg.brave.software"
 
 # Model to request from POST /v1/chat/completions.

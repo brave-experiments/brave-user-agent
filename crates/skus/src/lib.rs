@@ -53,11 +53,53 @@ pub const PAYMENT_BASE_URL: &str = "https://payment.rewards.brave.com";
 /// The SKU a Leo Premium subscription is sold under.
 pub const LEO_SKU: &str = "brave-leo-premium";
 
-/// The order `location` that marks an order as Leo's.
+/// The order `location` values that mark an order as Leo's, one per environment.
 ///
 /// A subscription to Brave VPN or Brave Search Premium sits in the same store, so the product is
-/// identified by this rather than by being the only order present.
-pub const LEO_LOCATION: &str = "leo.brave.com";
+/// identified by this rather than by being the only order present. Every environment is listed
+/// because a developer build holds staging orders, and matching only production would find nothing
+/// there while reporting it as "no subscription".
+pub const LEO_LOCATIONS: [&str; 3] = [
+    "leo.brave.com",
+    "leo.bravesoftware.com",
+    "leo.brave.software",
+];
 
 /// The cookie the aichat backend reads a subscription credential from.
 pub const CREDENTIAL_COOKIE_NAME: &str = "__Secure-sku#brave-leo-premium";
+
+/// A random uuid identifying one device's credential batch.
+///
+/// A fresh one is what distinguishes registering a new device from claiming an existing device's
+/// batch, so it must never be reused or derived from anything predictable.
+///
+/// Written out rather than adding a uuid dependency for one value; only the randomness matters, and
+/// that comes from the OS.
+pub fn new_request_id() -> String {
+    let mut bytes = [0u8; 16];
+    fill_random(&mut bytes);
+
+    // Set the version and variant bits, so this is a well-formed v4 uuid rather than 16 random
+    // bytes that merely look like one.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Fill `bytes` from the OS random source.
+///
+/// A failure is not survivable: a predictable request id could collide with another device's batch,
+/// so there is no sensible fallback to a weaker source.
+fn fill_random(bytes: &mut [u8]) {
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(bytes);
+}

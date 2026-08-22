@@ -252,7 +252,7 @@ fn import_leo_creds(args: &[String]) -> ExitCode {
                 Some(parsed) => channel = Some(parsed),
                 None => {
                     eprintln!("unknown channel: {other}");
-                    eprintln!("expected one of: stable, beta, nightly");
+                    eprintln!("expected one of: stable, beta, nightly, development");
                     return ExitCode::FAILURE;
                 }
             },
@@ -308,7 +308,7 @@ fn import_leo_creds(args: &[String]) -> ExitCode {
 
     // A fresh request id is what makes this a new device rather than a claim on an existing
     // device's batch.
-    let request_id = new_request_id();
+    let request_id = bua_skus::new_request_id();
 
     let registration =
         match bua_skus::device::register(bua_skus::PAYMENT_BASE_URL, &order_id, &request_id) {
@@ -337,41 +337,6 @@ fn import_leo_creds(args: &[String]) -> ExitCode {
     println!("stored {count} credentials in the system keychain, valid through {last}");
     println!("premium requests will now use them; the browser's own credentials were untouched");
     ExitCode::SUCCESS
-}
-
-/// A random uuid identifying this device's credential batch.
-///
-/// Version 4 from the OS random source. Written out rather than adding a uuid dependency for one
-/// value; only the randomness matters, and that comes from `getrandom`.
-fn new_request_id() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom(&mut bytes);
-
-    // Set the version and variant bits, so this is a well-formed v4 uuid rather than 16 random
-    // bytes that merely look like one.
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
-}
-
-/// Fill `bytes` from the OS random source.
-fn getrandom(bytes: &mut [u8]) {
-    use std::io::Read;
-
-    // A request id only has to be unique, and /dev/urandom is the same source the rest of this
-    // depends on. A failure here is not survivable: a predictable request id could collide with
-    // another device's batch.
-    let mut file = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
-    file.read_exact(bytes).expect("read /dev/urandom");
 }
 
 /// Report whether configuration is usable, without revealing the signing key.
@@ -411,11 +376,7 @@ fn doctor() -> ExitCode {
 ///
 /// Counts only: a credential is a bearer secret, so none of it is printed.
 fn report_subscription() {
-    for channel in [
-        bua_skus::Channel::Stable,
-        bua_skus::Channel::Beta,
-        bua_skus::Channel::Nightly,
-    ] {
+    for channel in bua_skus::Channel::ALL {
         if let Ok(stored) = bua_skus::store::load(channel) {
             println!(
                 "  leo       {} subscription imported, {} of {} credentials unspent",

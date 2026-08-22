@@ -32,15 +32,27 @@ pub enum Channel {
     Stable,
     Beta,
     Nightly,
+    /// A local developer build.
+    ///
+    /// Its store usually holds staging or development orders rather than production ones, which is
+    /// the point of it: a services key issued for one environment only works against that
+    /// environment's hosts.
+    Development,
 }
 
 impl Channel {
+    /// Every channel, in the order they are searched when none is named.
+    ///
+    /// Stable first, since that is what someone importing once most likely has.
+    pub const ALL: [Self; 4] = [Self::Stable, Self::Beta, Self::Nightly, Self::Development];
+
     /// Parse a channel name as a person would type it.
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "stable" | "release" => Some(Self::Stable),
             "beta" => Some(Self::Beta),
             "nightly" | "canary" => Some(Self::Nightly),
+            "development" | "dev" => Some(Self::Development),
             _ => None,
         }
     }
@@ -53,6 +65,9 @@ impl Channel {
             Self::Stable => "",
             Self::Beta => "-Beta",
             Self::Nightly => "-Nightly",
+            // Not "-Dev": an unofficial build takes this suffix, which is what a local
+            // developer build of Brave is.
+            Self::Development => "-Development",
         }
     }
 
@@ -61,6 +76,7 @@ impl Channel {
             Self::Stable => "stable",
             Self::Beta => "beta",
             Self::Nightly => "nightly",
+            Self::Development => "development",
         }
     }
 
@@ -288,7 +304,11 @@ fn leo_order_in_preferences(text: &str) -> Result<String, OrderLookupError> {
 /// Matched on `location` and on any item's `sku`, since the same store holds VPN and Search
 /// Premium orders and either field alone has been enough to identify a product at some point.
 fn is_leo_order(order: &serde_json::Value) -> bool {
-    if order.get("location").and_then(serde_json::Value::as_str) == Some(crate::LEO_LOCATION) {
+    if order
+        .get("location")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|location| crate::LEO_LOCATIONS.contains(&location))
+    {
         return true;
     }
 
@@ -356,7 +376,9 @@ mod tests {
         assert_eq!(Channel::parse("stable"), Some(Channel::Stable));
         assert_eq!(Channel::parse("Beta"), Some(Channel::Beta));
         assert_eq!(Channel::parse("  NIGHTLY  "), Some(Channel::Nightly));
-        assert_eq!(Channel::parse("dev"), None);
+        assert_eq!(Channel::parse("dev"), Some(Channel::Development));
+        assert_eq!(Channel::parse("development"), Some(Channel::Development));
+        assert_eq!(Channel::parse("staging"), None);
     }
 
     /// Stable's directory has no suffix, so deriving the path from the channel name would look
@@ -365,6 +387,8 @@ mod tests {
     fn the_stable_channel_directory_carries_no_suffix() {
         assert_eq!(Channel::Stable.directory_suffix(), "");
         assert_eq!(Channel::Beta.directory_suffix(), "-Beta");
+        // A developer build writes to -Development, not the -Dev an official dev channel uses.
+        assert_eq!(Channel::Development.directory_suffix(), "-Development");
     }
 
     /// `Local State` must be consulted before the profile preference file, because a migrated
@@ -429,6 +453,43 @@ mod tests {
             }
         }));
         assert_eq!(leo_order_in_preferences(&text).unwrap(), leo);
+    }
+
+    /// A developer build holds staging orders, whose location is on bravesoftware.com. Matching only
+    /// the production domain would find nothing there and report it as no subscription at all.
+    #[test]
+    fn a_staging_order_is_recognised_as_leo() {
+        let id = "d23566a7-49c1-4155-8a0a-f0a354d0c362";
+        let text = preferences_with(serde_json::json!({
+            "orders": {
+                id: {
+                    "id": id,
+                    "status": "paid",
+                    "location": "leo.bravesoftware.com",
+                    "items": [{ "sku": "brave-leo-premium" }]
+                }
+            }
+        }));
+        assert_eq!(leo_order_in_preferences(&text).unwrap(), id);
+    }
+
+    /// Another staging product in the same store must still not be mistaken for Leo.
+    #[test]
+    fn a_staging_order_for_another_product_is_not_leo() {
+        let text = preferences_with(serde_json::json!({
+            "orders": {
+                "cc0d2e6b-e4cc-4ae5-99d2-f16583d822de": {
+                    "id": "cc0d2e6b-e4cc-4ae5-99d2-f16583d822de",
+                    "status": "paid",
+                    "location": "origin.bravesoftware.com",
+                    "items": [{ "sku": "brave-origin" }]
+                }
+            }
+        }));
+        assert_eq!(
+            leo_order_in_preferences(&text).unwrap_err(),
+            OrderLookupError::Absent
+        );
     }
 
     #[test]
