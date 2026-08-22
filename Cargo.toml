@@ -12,7 +12,7 @@ license = "MPL-2.0"
 repository = "https://github.com/brave-experiments/brave-user-agent"
 
 [workspace.dependencies]
-base64 = "0.22"
+base64 = "0.23"
 # The blinded-token scheme Brave's SKU SDK uses, at the version brave-core builds
 # against. Hand-rolling Ristretto VOPRF would be far worse than depending on the
 # implementation both ends of this protocol already agree on.
