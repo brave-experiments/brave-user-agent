@@ -17,7 +17,7 @@ base64 = "0.22"
 # against. Hand-rolling Ristretto VOPRF would be far worse than depending on the
 # implementation both ends of this protocol already agree on.
 challenge-bypass-ristretto = { version = "2.1.0", features = ["serde_base64"] }
-hmac = "0.12"
+hmac = "0.13"
 # Secret storage for the imported subscription credentials. Default features only:
 # the sync-secret-service backend would pull in C libdbus and break the cross-builds,
 # whereas the default zbus backend is pure Rust on every target here.
