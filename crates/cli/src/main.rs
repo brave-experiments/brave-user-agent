@@ -23,6 +23,7 @@ fn main() -> ExitCode {
         // With no arguments the interactive session is the natural default.
         None => interactive(),
         Some("doctor") => doctor(),
+        Some("import-leo-creds") => import_leo_creds(&args[1..]),
         Some(flag) if flag.starts_with('-') => {
             eprintln!("unknown option: {flag}");
             print_help();
@@ -40,6 +41,7 @@ fn print_help() {
     println!("  bua                               Start an interactive session");
     println!("  bua \"<task>\" [--file <path>]...   Run a single task");
     println!("  bua doctor                        Check configuration and confinement");
+    println!("  bua import-leo-creds [channel]    Import a Leo Premium subscription");
     println!();
     println!("Interactive keys:");
     println!("  Enter                 Send");
@@ -230,6 +232,148 @@ fn current_workspace() -> Result<Workspace, String> {
         .and_then(|dir| Workspace::new(dir).map_err(|e| e.to_string()))
 }
 
+/// Import a Leo Premium subscription from a local Brave install.
+///
+/// This registers as an *additional* device rather than taking the browser's credentials, so the
+/// browser keeps its own and nothing it holds is spent. Only the order id is read from the
+/// profile; the credentials themselves are minted here and signed by Brave's service.
+fn import_leo_creds(args: &[String]) -> ExitCode {
+    let mut channel = None;
+    let mut forget = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "--forget" => forget = true,
+            other if other.starts_with('-') => {
+                eprintln!("unknown option: {other}");
+                return ExitCode::FAILURE;
+            }
+            other => match bua_skus::Channel::parse(other) {
+                Some(parsed) => channel = Some(parsed),
+                None => {
+                    eprintln!("unknown channel: {other}");
+                    eprintln!("expected one of: stable, beta, nightly");
+                    return ExitCode::FAILURE;
+                }
+            },
+        }
+    }
+
+    // Stable is what someone importing without saying which install means.
+    let channel = channel.unwrap_or(bua_skus::Channel::Stable);
+
+    if forget {
+        return match bua_skus::store::clear(channel) {
+            Ok(()) => {
+                println!("forgot the {} subscription", channel.as_str());
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // Warned about early: the import would otherwise succeed and then never be used, since a
+    // credential is only ever sent to the premium host.
+    match Config::from_env() {
+        Ok(config) if config.premium_endpoint.is_none() => {
+            eprintln!(
+                "warning: this build has no premium endpoint, so imported credentials will not be used"
+            );
+            eprintln!(
+                "         set {} and rebuild",
+                bua_config::env_var::PREMIUM_ENDPOINT
+            );
+        }
+        _ => {}
+    }
+
+    println!(
+        "looking for a Leo subscription in Brave {}",
+        channel.as_str()
+    );
+
+    let order_id = match bua_skus::find_leo_order(channel) {
+        Ok(order_id) => order_id,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("found subscription {order_id}");
+    println!("registering this install as a new device");
+
+    // A fresh request id is what makes this a new device rather than a claim on an existing
+    // device's batch.
+    let request_id = new_request_id();
+
+    let registration =
+        match bua_skus::device::register(bua_skus::PAYMENT_BASE_URL, &order_id, &request_id) {
+            Ok(registration) => registration,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    let credentials: bua_skus::StoredCredentials = registration.into();
+    let count = credentials.credentials.len();
+    let last = credentials
+        .credentials
+        .iter()
+        .map(|c| c.valid_to.as_str())
+        .max()
+        .unwrap_or("unknown")
+        .to_string();
+
+    if let Err(err) = bua_skus::store::save(channel, &credentials) {
+        eprintln!("{err}");
+        return ExitCode::FAILURE;
+    }
+
+    println!("stored {count} credentials in the system keychain, valid through {last}");
+    println!("premium requests will now use them; the browser's own credentials were untouched");
+    ExitCode::SUCCESS
+}
+
+/// A random uuid identifying this device's credential batch.
+///
+/// Version 4 from the OS random source. Written out rather than adding a uuid dependency for one
+/// value; only the randomness matters, and that comes from `getrandom`.
+fn new_request_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom(&mut bytes);
+
+    // Set the version and variant bits, so this is a well-formed v4 uuid rather than 16 random
+    // bytes that merely look like one.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Fill `bytes` from the OS random source.
+fn getrandom(bytes: &mut [u8]) {
+    use std::io::Read;
+
+    // A request id only has to be unique, and /dev/urandom is the same source the rest of this
+    // depends on. A failure here is not survivable: a predictable request id could collide with
+    // another device's batch.
+    let mut file = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
+    file.read_exact(bytes).expect("read /dev/urandom");
+}
+
 /// Report whether configuration is usable, without revealing the signing key.
 fn doctor() -> ExitCode {
     let mut ok = true;
@@ -238,9 +382,14 @@ fn doctor() -> ExitCode {
         Ok(config) => {
             println!("configuration OK");
             println!("  endpoint  {}", config.chat_completions_url());
+            match config.premium_chat_completions_url() {
+                Some(url) => println!("  premium   {url}"),
+                None => println!("  premium   not configured"),
+            }
             println!("  key id    {}", config.key_id);
             println!("  model     {}", config.model);
             println!("  key       {} (never transmitted)", config.signing_key);
+            report_subscription();
         }
         Err(err) => {
             eprintln!("configuration error: {err}");
@@ -255,6 +404,26 @@ fn doctor() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Report which channels have an imported subscription, and how much of it is left.
+///
+/// Counts only: a credential is a bearer secret, so none of it is printed.
+fn report_subscription() {
+    for channel in [
+        bua_skus::Channel::Stable,
+        bua_skus::Channel::Beta,
+        bua_skus::Channel::Nightly,
+    ] {
+        if let Ok(stored) = bua_skus::store::load(channel) {
+            println!(
+                "  leo       {} subscription imported, {} of {} credentials unspent",
+                channel.as_str(),
+                stored.remaining(),
+                stored.credentials.len()
+            );
+        }
     }
 }
 

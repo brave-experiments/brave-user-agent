@@ -34,6 +34,18 @@ export BRAVE_AI_CHAT_ENDPOINT="https://ai-chat.bsg.brave.software"
 # Point this at a locally running backend for development, e.g.
 # export BRAVE_AI_CHAT_ENDPOINT="http://127.0.0.1:8000"
 
+# Host for the premium tier, used once a Leo Premium subscription has been imported
+# with `bua import-leo-creds`. Same environments, with the ai-chat-premium prefix:
+#   prod     ai-chat-premium.bsg.brave.com
+#   staging  ai-chat-premium.bsg.bravesoftware.com
+#   dev      ai-chat-premium.bsg.brave.software     (VPN only)
+#
+# Optional. Without it premium is unavailable and every request goes to the endpoint
+# above; a subscription credential is never sent to the free host, since it does not
+# belong there. It has to match the environment the subscription was bought in, so a
+# real subscription needs the production host.
+export BRAVE_AI_CHAT_PREMIUM_ENDPOINT="https://ai-chat-premium.bsg.brave.software"
+
 # Model to request from POST /v1/chat/completions.
 # "automatic" lets the server triage per request and is the default.
 #

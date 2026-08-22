@@ -92,6 +92,12 @@ pub struct Config {
     pub key_id: String,
     /// Base URL. The API path is appended by the client.
     pub endpoint: String,
+    /// Base URL for the premium tier, when this build has one.
+    ///
+    /// `None` leaves premium unavailable, which is the right outcome for a build that was never
+    /// given the host: falling back to the free endpoint with a subscription credential attached
+    /// would send the credential somewhere it does not belong.
+    pub premium_endpoint: Option<String>,
     /// Model to request. The server may substitute a different one.
     pub model: String,
 }
@@ -153,10 +159,19 @@ impl Config {
             .filter(|m| !m.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
+        // A premium host that is present but malformed is dropped rather than rejected: it only
+        // matters to someone who has imported a subscription, and failing every run over it would
+        // punish everyone else.
+        let premium_endpoint = lookup(env_var::PREMIUM_ENDPOINT)
+            .map(|value| value.trim().to_string())
+            .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+            .map(|value| value.trim_end_matches('/').to_string());
+
         Ok(Self {
             signing_key,
             key_id,
             endpoint: endpoint.trim_end_matches('/').to_string(),
+            premium_endpoint,
             model,
         })
     }
@@ -167,6 +182,13 @@ impl Config {
     /// there is no `/v2/` route to construct.
     pub fn chat_completions_url(&self) -> String {
         format!("{}/v1/chat/completions", self.endpoint)
+    }
+
+    /// The same endpoint on the premium host, when this build has one.
+    pub fn premium_chat_completions_url(&self) -> Option<String> {
+        self.premium_endpoint
+            .as_ref()
+            .map(|base| format!("{base}/v1/chat/completions"))
     }
 }
 
@@ -293,6 +315,57 @@ mod tests {
         assert_eq!(
             config.chat_completions_url(),
             "http://127.0.0.1:8000/v1/chat/completions"
+        );
+    }
+
+    /// The premium tier is a separate deployment, so its URL must come from its own variable
+    /// rather than being derived from the free host.
+    #[test]
+    fn the_premium_endpoint_builds_its_own_url() {
+        let config = Config::from_lookup(|k| match k {
+            env_var::PREMIUM_ENDPOINT => Some("https://premium.invalid".into()),
+            other => complete_env(other),
+        })
+        .unwrap();
+        assert_eq!(
+            config.premium_chat_completions_url().as_deref(),
+            Some("https://premium.invalid/v1/chat/completions")
+        );
+    }
+
+    /// A build without the premium host must report premium as unavailable rather than quietly
+    /// using the free endpoint, which would send a subscription credential to the wrong host.
+    #[test]
+    fn a_build_without_a_premium_endpoint_has_no_premium_url() {
+        let config = Config::from_lookup(complete_env).unwrap();
+        assert_eq!(config.premium_endpoint, None);
+        assert_eq!(config.premium_chat_completions_url(), None);
+    }
+
+    /// A blank or schemeless premium host is discarded, not turned into a request to a host with
+    /// no scheme.
+    #[test]
+    fn a_malformed_premium_endpoint_is_discarded() {
+        for value in ["", "   ", "premium.invalid"] {
+            let config = Config::from_lookup(|k| match k {
+                env_var::PREMIUM_ENDPOINT => Some(value.into()),
+                other => complete_env(other),
+            })
+            .unwrap();
+            assert_eq!(config.premium_endpoint, None, "accepted '{value}'");
+        }
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_premium_endpoint_does_not_double_up() {
+        let config = Config::from_lookup(|k| match k {
+            env_var::PREMIUM_ENDPOINT => Some("https://premium.invalid/".into()),
+            other => complete_env(other),
+        })
+        .unwrap();
+        assert_eq!(
+            config.premium_chat_completions_url().as_deref(),
+            Some("https://premium.invalid/v1/chat/completions")
         );
     }
 

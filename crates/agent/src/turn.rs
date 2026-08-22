@@ -324,7 +324,18 @@ fn run_inner<S: Sink, C: Confirmer, R: Reporter>(
 
     messages.push(Message::user(task.prompt.clone()));
 
-    let client = AichatClient::new(config, egress);
+    // Premium is used when a subscription has been imported and this build knows the premium
+    // host, and is silently skipped otherwise. Discovery happens per turn so an import mid-session
+    // takes effect on the next one.
+    let mut subscription = config
+        .premium_endpoint
+        .as_ref()
+        .and_then(|_| crate::ImportedSubscription::discover());
+
+    let mut client = AichatClient::new(config, egress);
+    if let Some(subscription) = subscription.as_mut() {
+        client = client.with_subscription(subscription);
+    }
     let offered = tools::available();
 
     let mut steps = 0;

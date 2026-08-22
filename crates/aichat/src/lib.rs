@@ -70,14 +70,69 @@ pub struct Completion {
     pub usage: protocol::Usage,
 }
 
+/// A source of subscription credentials, one per request.
+///
+/// A trait rather than a stored string because each credential is single-use: presenting one
+/// spends it, so a request has to ask for its own rather than reuse a cached value. It is also
+/// what keeps this crate independent of where credentials come from.
+pub trait Subscription {
+    /// The cookie value presenting the next credential, or `None` to send this request on the
+    /// free tier.
+    ///
+    /// Returning `None` rather than failing is deliberate: an exhausted or expired batch should
+    /// degrade to the free tier, not break the session.
+    fn next_credential(&mut self) -> Option<SubscriptionCredential>;
+}
+
+/// A credential ready to be attached to one request.
+pub struct SubscriptionCredential {
+    /// The cookie name the backend reads.
+    pub cookie_name: String,
+    /// The presented credential.
+    pub cookie_value: String,
+}
+
 pub struct AichatClient<'a> {
     config: &'a Config,
     egress: &'a Egress,
+    subscription: Option<&'a mut dyn Subscription>,
 }
 
 impl<'a> AichatClient<'a> {
     pub fn new(config: &'a Config, egress: &'a Egress) -> Self {
-        Self { config, egress }
+        Self {
+            config,
+            egress,
+            subscription: None,
+        }
+    }
+
+    /// Send requests on the premium tier, spending a credential on each.
+    pub fn with_subscription(mut self, subscription: &'a mut dyn Subscription) -> Self {
+        self.subscription = Some(subscription);
+        self
+    }
+
+    /// Where this request goes, and any credential to attach.
+    ///
+    /// The premium host and the credential travel together: a credential belongs to the premium
+    /// deployment, so a build with no premium host stays on the free tier rather than sending the
+    /// credential somewhere it does not belong.
+    fn route(&mut self) -> (String, Option<SubscriptionCredential>) {
+        let free = self.config.chat_completions_url();
+
+        let Some(premium_url) = self.config.premium_chat_completions_url() else {
+            return (free, None);
+        };
+
+        match self
+            .subscription
+            .as_mut()
+            .and_then(|source| source.next_credential())
+        {
+            Some(credential) => (premium_url, Some(credential)),
+            None => (free, None),
+        }
     }
 
     /// Send a chat completion request.
@@ -85,7 +140,7 @@ impl<'a> AichatClient<'a> {
     /// The reply is labelled untrusted-public: it is remote content we do not control,
     /// but carries no confidentiality of ours.
     pub fn complete<S: Sink>(
-        &self,
+        &mut self,
         policy: &mut Policy<'_, S>,
         request: &ChatRequest,
     ) -> Result<Completion, ChatError> {
@@ -94,10 +149,19 @@ impl<'a> AichatClient<'a> {
         let headers =
             bua_signing::sign(self.config.signing_key.expose(), &self.config.key_id, &body);
 
-        let http = Request::post(self.config.chat_completions_url(), body)
+        let (url, credential) = self.route();
+
+        let mut http = Request::post(url, body)
             .header("content-type", "application/json")
             .header("digest", &headers.digest)
             .header("authorization", &headers.authorization);
+
+        if let Some(credential) = credential {
+            http = http.header(
+                "cookie",
+                format!("{}={}", credential.cookie_name, credential.cookie_value),
+            );
+        }
 
         let response = self.egress.fetch(policy, http, Label::untrusted_public())?;
 
@@ -139,7 +203,7 @@ impl<'a> AichatClient<'a> {
     /// nothing of what it wrote. The reply is untrusted model output, so handing the text to a
     /// callback would be handing untrusted content to the driver. A count is not content.
     pub fn complete_streaming<S: Sink>(
-        &self,
+        &mut self,
         policy: &mut Policy<'_, S>,
         request: &ChatRequest,
         mut progress: impl FnMut(Progress),
@@ -150,11 +214,20 @@ impl<'a> AichatClient<'a> {
         let headers =
             bua_signing::sign(self.config.signing_key.expose(), &self.config.key_id, &body);
 
-        let http = Request::post(self.config.chat_completions_url(), body)
+        let (url, credential) = self.route();
+
+        let mut http = Request::post(url, body)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             .header("digest", &headers.digest)
             .header("authorization", &headers.authorization);
+
+        if let Some(credential) = credential {
+            http = http.header(
+                "cookie",
+                format!("{}={}", credential.cookie_name, credential.cookie_value),
+            );
+        }
 
         let mut stream = self
             .egress

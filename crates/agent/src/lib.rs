@@ -9,11 +9,13 @@ pub mod diff;
 pub mod glob;
 pub mod replace;
 pub mod report;
+pub mod subscription;
 pub mod tools;
 pub mod turn;
 pub mod workspace;
 
 pub use confirm::{Confirmer, Decision, Intent, RefuseWrites, WriteRequest};
 pub use report::{IgnoreReports, Reporter};
+pub use subscription::ImportedSubscription;
 pub use turn::{Outcome, Task, TurnError};
 pub use workspace::{Workspace, WorkspaceError};

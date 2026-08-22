@@ -187,7 +187,7 @@ fn a_completion_round_trips() {
     )
     .expect("policy");
 
-    let client = AichatClient::new(&config, &egress);
+    let mut client = AichatClient::new(&config, &egress);
     let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
     let completion = client
         .complete(&mut policy, &request)
@@ -223,7 +223,7 @@ fn the_request_carries_the_signing_headers() {
     )
     .expect("policy");
 
-    let client = AichatClient::new(&config, &egress);
+    let mut client = AichatClient::new(&config, &egress);
     let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
     client.complete(&mut policy, &request).expect("completion");
 
@@ -271,7 +271,7 @@ fn the_request_body_matches_the_protocol() {
     )
     .expect("policy");
 
-    let client = AichatClient::new(&config, &egress);
+    let mut client = AichatClient::new(&config, &egress);
     let request = ChatRequest::new(
         "automatic",
         vec![Message::system("be brief"), Message::user("hi")],
@@ -301,7 +301,7 @@ fn a_completion_without_the_capability_is_refused() {
     )
     .expect("policy");
 
-    let client = AichatClient::new(&config, &egress);
+    let mut client = AichatClient::new(&config, &egress);
     let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
     let error = client
         .complete(&mut policy, &request)
@@ -325,7 +325,7 @@ fn a_response_without_content_is_an_error() {
     )
     .expect("policy");
 
-    let client = AichatClient::new(&config, &egress);
+    let mut client = AichatClient::new(&config, &egress);
     let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
     let error = client
         .complete(&mut policy, &request)
@@ -358,7 +358,7 @@ fn a_streamed_completion_arrives_in_pieces() {
     )
     .expect("policy");
 
-    let client = AichatClient::new(&config, &egress);
+    let mut client = AichatClient::new(&config, &egress);
     let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
 
     let mut seen = Vec::new();
@@ -428,7 +428,7 @@ fn a_streamed_tool_call_is_reassembled() {
     )
     .expect("policy");
 
-    let client = AichatClient::new(&config, &egress);
+    let mut client = AichatClient::new(&config, &egress);
     let request = ChatRequest::new("automatic", vec![Message::user("read a.rs")]);
     let completion = client
         .complete_streaming(&mut policy, &request, |_| {})
@@ -458,7 +458,7 @@ fn a_streamed_request_without_the_capability_is_refused() {
     )
     .expect("policy");
 
-    let client = AichatClient::new(&config, &egress);
+    let mut client = AichatClient::new(&config, &egress);
     let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
     let error = client
         .complete_streaming(&mut policy, &request, |_| {})
@@ -487,7 +487,7 @@ fn a_stream_with_no_content_is_an_error() {
     )
     .expect("policy");
 
-    let client = AichatClient::new(&config, &egress);
+    let mut client = AichatClient::new(&config, &egress);
     let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
     let error = client
         .complete_streaming(&mut policy, &request, |_| {})
@@ -516,7 +516,7 @@ fn unparseable_frames_do_not_lose_the_reply() {
     )
     .expect("policy");
 
-    let client = AichatClient::new(&config, &egress);
+    let mut client = AichatClient::new(&config, &egress);
     let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
     let completion = client
         .complete_streaming(&mut policy, &request, |_| {})
@@ -524,4 +524,122 @@ fn unparseable_frames_do_not_lose_the_reply() {
 
     let proof = policy.authorise_display_release("test reads the reply");
     assert_eq!(completion.content.declassify(&proof), "still here");
+}
+
+/// A stub subscription handing out one credential, so routing can be tested without a keychain.
+struct StubSubscription {
+    remaining: usize,
+}
+
+impl bua_aichat::Subscription for StubSubscription {
+    fn next_credential(&mut self) -> Option<bua_aichat::SubscriptionCredential> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        Some(bua_aichat::SubscriptionCredential {
+            cookie_name: "__Secure-sku#brave-leo-premium".to_string(),
+            cookie_value: "presented-credential".to_string(),
+        })
+    }
+}
+
+fn premium_config(endpoint: &str, premium: &str) -> Config {
+    Config::from_lookup(|key| match key {
+        "SERVICES_KEY_AICHAT" => Some("test-signing-key".into()),
+        "BRAVE_SERVICES_KEY_ID" => Some("test-key-id".into()),
+        "BRAVE_AI_CHAT_ENDPOINT" => Some(endpoint.to_string()),
+        "BRAVE_AI_CHAT_PREMIUM_ENDPOINT" => Some(premium.to_string()),
+        _ => None,
+    })
+    .expect("config")
+}
+
+/// With a subscription, the request must go to the premium host and carry the credential as the
+/// cookie the backend reads. This is what the whole import exists to produce.
+#[test]
+fn a_subscribed_request_goes_to_the_premium_host_with_the_credential() {
+    let (premium_endpoint, received) = serve(REPLY);
+    // The free host is a port nothing is listening on, so reaching it would fail rather than
+    // quietly pass.
+    let config = premium_config("http://127.0.0.1:1", &premium_endpoint);
+    let egress = Egress::new();
+    let mut sink = RecordingSink::new();
+    let mut policy = Policy::begin(
+        routing(),
+        ReleasePlan::new(),
+        CapabilitySet::from_iter([Capability::WebFetch]),
+        &mut sink,
+    )
+    .expect("policy");
+
+    let mut subscription = StubSubscription { remaining: 1 };
+    let mut client = AichatClient::new(&config, &egress).with_subscription(&mut subscription);
+    let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
+    client
+        .complete(&mut policy, &request)
+        .expect("completion succeeds");
+
+    let captured = received.recv().expect("request captured");
+    assert_eq!(
+        captured.header("cookie"),
+        Some("__Secure-sku#brave-leo-premium=presented-credential")
+    );
+}
+
+/// Once the batch is spent the request must fall back to the free host, and must not carry a
+/// cookie: sending a subscription credential to the free endpoint would leak it to a host it does
+/// not belong to.
+#[test]
+fn an_exhausted_subscription_falls_back_to_the_free_host_without_a_credential() {
+    let (free_endpoint, received) = serve(REPLY);
+    let config = premium_config(&free_endpoint, "http://127.0.0.1:1");
+    let egress = Egress::new();
+    let mut sink = RecordingSink::new();
+    let mut policy = Policy::begin(
+        routing(),
+        ReleasePlan::new(),
+        CapabilitySet::from_iter([Capability::WebFetch]),
+        &mut sink,
+    )
+    .expect("policy");
+
+    let mut subscription = StubSubscription { remaining: 0 };
+    let mut client = AichatClient::new(&config, &egress).with_subscription(&mut subscription);
+    let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
+    client
+        .complete(&mut policy, &request)
+        .expect("completion succeeds");
+
+    let captured = received.recv().expect("request captured");
+    assert_eq!(captured.header("cookie"), None);
+}
+
+/// A build with no premium host must stay on the free tier even when credentials exist, rather
+/// than attaching one to a request bound for the free endpoint.
+#[test]
+fn without_a_premium_host_no_credential_is_attached() {
+    let (free_endpoint, received) = serve(REPLY);
+    let config = config_for(&free_endpoint);
+    let egress = Egress::new();
+    let mut sink = RecordingSink::new();
+    let mut policy = Policy::begin(
+        routing(),
+        ReleasePlan::new(),
+        CapabilitySet::from_iter([Capability::WebFetch]),
+        &mut sink,
+    )
+    .expect("policy");
+
+    let mut subscription = StubSubscription { remaining: 5 };
+    let mut client = AichatClient::new(&config, &egress).with_subscription(&mut subscription);
+    let request = ChatRequest::new("automatic", vec![Message::user("hi")]);
+    client
+        .complete(&mut policy, &request)
+        .expect("completion succeeds");
+
+    let captured = received.recv().expect("request captured");
+    assert_eq!(captured.header("cookie"), None);
+    // The credential must not have been spent either, since it was never usable here.
+    assert_eq!(subscription.remaining, 5);
 }

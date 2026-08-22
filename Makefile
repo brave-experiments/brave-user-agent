@@ -2,8 +2,8 @@ BINARY = bua
 VERSION = $(shell sed -nE 's/^version[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' Cargo.toml | head -n 1)
 
 # Forwarded into the cross-build container, which does not inherit the host environment.
-BUILD_ENV = SERVICES_KEY_AICHAT BRAVE_SERVICES_KEY_ID BRAVE_AI_CHAT_ENDPOINT MODEL \
-            BUA_ALLOW_UNCONFIGURED_BUILD
+BUILD_ENV = SERVICES_KEY_AICHAT BRAVE_SERVICES_KEY_ID BRAVE_AI_CHAT_ENDPOINT \
+            BRAVE_AI_CHAT_PREMIUM_ENDPOINT MODEL BUA_ALLOW_UNCONFIGURED_BUILD
 
 .PHONY: help
 help:
