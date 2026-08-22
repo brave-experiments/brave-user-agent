@@ -285,7 +285,23 @@ pub fn present(credential: &crate::store::Credential, issuer: &str) -> Result<St
         "signature": signature,
     });
 
-    Ok(base64_encode(redemption.to_string().as_bytes()))
+    // The cookie is not the redemption document, it is a request *about* one, with the redemption
+    // carried inside as its own base64 string. Sending the inner document alone is the natural
+    // mistake and the server rejects it as an invalid credential without saying why.
+    //
+    // `version` is 2 because that is what a time-limited-v2 credential is verified as; the type
+    // name and the version are separate fields and both are checked.
+    let request = serde_json::json!({
+        "type": "time-limited-v2",
+        "version": 2,
+        "sku": crate::LEO_SKU,
+        "presentation": base64_encode(redemption.to_string().as_bytes()),
+    });
+
+    // Base64 only. brave-core url-encodes at this point, but it is building a `Set-Cookie` value
+    // for a browser to store; this is a `Cookie` request header, and a percent-encoded payload is
+    // rejected as a malformed credential.
+    Ok(base64_encode(request.to_string().as_bytes()))
 }
 
 /// Read the order, and with it what credentials may be issued.
@@ -915,8 +931,20 @@ mod tests {
         };
 
         let presentation = present(&credential, "brave.com?sku=brave-leo-premium").unwrap();
-        let decoded = decode_base64_for_test(&presentation);
-        let document: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        let outer: serde_json::Value =
+            serde_json::from_slice(&decode_base64_for_test(&presentation)).unwrap();
+
+        // The outer layer describes what is being presented. Sending the redemption without it is
+        // what the service reports as an invalid credential, with nothing to say which part is
+        // wrong.
+        assert_eq!(outer["type"], "time-limited-v2");
+        assert_eq!(outer["version"], 2);
+        assert_eq!(outer["sku"], "brave-leo-premium");
+
+        // The redemption is nested inside, as its own base64 string.
+        let inner = outer["presentation"].as_str().expect("a nested redemption");
+        let document: serde_json::Value =
+            serde_json::from_slice(&decode_base64_for_test(inner)).unwrap();
 
         assert_eq!(document["issuer"], "brave.com?sku=brave-leo-premium");
         assert_eq!(document["validTo"], "2026-08-23T00:00:00Z");
@@ -926,6 +954,31 @@ mod tests {
                 .is_some_and(|s| !s.is_empty())
         );
         assert!(document["t"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    /// The cookie must be plain base64. brave-core percent-encodes at the equivalent point, but it
+    /// is building a Set-Cookie value for a browser to store; a percent-encoded payload in a Cookie
+    /// request header is rejected as a malformed credential.
+    #[test]
+    fn the_presentation_is_base64_and_not_percent_encoded() {
+        let credential = crate::store::Credential {
+            unblinded: issue_one_credential().encode_base64(),
+            valid_from: "2026-08-22T00:00:00".to_string(),
+            valid_to: "2026-08-23T00:00:00".to_string(),
+            spent: false,
+            rfc: true,
+        };
+
+        let presentation = present(&credential, "brave.com?sku=brave-leo-premium").unwrap();
+        assert!(
+            !presentation.contains('%'),
+            "percent-encoded: {presentation}"
+        );
+        // Base64 of a JSON object always begins with the encoding of '{'.
+        assert!(
+            presentation.starts_with('e'),
+            "not base64 JSON: {presentation}"
+        );
     }
 
     /// The rfc flag selects the key derivation, and the wrong one yields a different signature
