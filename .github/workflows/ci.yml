@@ -26,7 +26,7 @@ jobs:
     name: Format, lint, and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -52,7 +52,7 @@ jobs:
     name: Minimum supported Rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Read rust-version from the workspace
         id: msrv
@@ -102,7 +102,7 @@ jobs:
             target: aarch64-pc-windows-gnullvm
             ext: ".exe"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Same Dockerfile the Makefile uses, so a local build and a CI build produce
       # the same artifact rather than diverging through a separate host toolchain.
